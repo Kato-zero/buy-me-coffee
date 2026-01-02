@@ -1,0 +1,9 @@
+<button id="coffee">Buy me a coffee</button>
+
+<script>
+document.getElementById("coffee").onclick = async () => {
+  const res = await fetch("/api/create-payment", { method: "POST" });
+  const data = await res.json();
+  console.log(data);
+};
+</script>
