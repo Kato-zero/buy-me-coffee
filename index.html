@@ -2011,25 +2011,22 @@
             throw new Error('Ticket not found');
         }
         
-        // Remove from local array
-        this.tickets.splice(ticketIndex, 1);
-        
-        // Track deleted tickets locally to prevent re-download
-        const deletedTickets = JSON.parse(localStorage.getItem('deletedTickets') || '[]');
-        if (!deletedTickets.includes(ticketId)) {
-            deletedTickets.push(ticketId);
-            localStorage.setItem('deletedTickets', JSON.stringify(deletedTickets));
-        }
+        // Mark as deleted locally
+        this.tickets[ticketIndex].deleted = true;
+        this.tickets[ticketIndex].deletedAt = new Date().toISOString();
         
         // Save locally
         await this.storage.saveTickets(this.tickets);
         
-        // Delete from cloud if connected
+        // Update in cloud (soft delete)
         if (this.cloudSync.supabase) {
             await this.cloudSync.deleteTicketAndSync(ticketId);
         }
         
+        // Update stats - filter out deleted tickets
+        this.tickets = this.tickets.filter(t => !t.deleted);
         this.updateStats();
+        
         this.showToast('Ticket deleted successfully', 'success');
         
         return true;
@@ -2040,7 +2037,178 @@
         return false;
     }
 }
+            async deleteTicketFromCloud(ticketId) {
+    if (!this.supabase) return;
+    
+    try {
+        // SOFT DELETE instead of hard delete
+        const { error } = await this.supabase
+            .from('tickets')
+            .update({
+                deleted: true,
+                deleted_at: new Date().toISOString(),
+                deleted_by: this.deviceId,
+                updated_at: new Date().toISOString()
+            })
+            .eq('id', ticketId);
+        
+        if (error) throw error;
+        
+    } catch (error) {
+        console.error('Error deleting ticket from cloud:', error);
+        throw error;
+    }
+}
+async downloadLatestTickets() {
+    if (!this.supabase || !window.ticketManager) return;
+    
+    try {
+        // Only download non-deleted tickets
+        const { data: cloudTickets, error } = await this.supabase
+            .from('tickets')
+            .select('*')
+            .eq('deleted', false)  // ONLY GET NON-DELETED TICKETS
+            .order('updated_at', { ascending: false });
+        
+        if (error) throw error;
+        
+        if (cloudTickets && cloudTickets.length > 0) {
+            const localTickets = cloudTickets.map(ticket => ({
+                id: ticket.id,
+                purchaseDateTime: ticket.purchase_datetime,
+                name: ticket.name,
+                email: ticket.email,
+                phone: ticket.phone,
+                ticketType: ticket.ticket_type,
+                quantity: ticket.quantity,
+                maxScans: ticket.max_scans,
+                amount: ticket.amount,
+                event: ticket.event,
+                eventTime: ticket.event_time,
+                eventDate: ticket.event_date,
+                venue: ticket.venue,
+                used: ticket.used,
+                usedAt: ticket.used_at,
+                scannedBy: ticket.scanned_by,
+                scanCount: ticket.scan_count || 0,
+                updatedAt: ticket.updated_at,
+                deleted: ticket.deleted || false  // Add deleted flag
+            }));
             
+            // Merge strategy: Keep cloud's non-deleted tickets
+            const localTicketsMap = new Map();
+            
+            // First, add all local tickets that aren't marked as deleted in cloud
+            window.ticketManager.tickets.forEach(ticket => {
+                localTicketsMap.set(ticket.id, ticket);
+            });
+            
+            // Update or add cloud tickets
+            localTickets.forEach(cloudTicket => {
+                localTicketsMap.set(cloudTicket.id, cloudTicket);
+            });
+            
+            // Remove any tickets that are marked as deleted
+            const finalTickets = Array.from(localTicketsMap.values())
+                .filter(ticket => !ticket.deleted);
+            
+            window.ticketManager.tickets = finalTickets;
+            await window.storageManager.saveTickets(window.ticketManager.tickets, false);
+            window.ticketManager.updateStats();
+        }
+        
+    } catch (error) {
+        console.error('Error downloading tickets:', error);
+    }
+}
+setupRealtimeUpdates() {
+    if (!this.supabase) return;
+    
+    try {
+        // Subscribe to ALL ticket updates including deletions
+        this.realtimeSubscription = this.supabase
+            .channel('ticket-updates')
+            .on(
+                'postgres_changes',
+                { 
+                    event: '*', 
+                    schema: 'public', 
+                    table: 'tickets',
+                    filter: 'deleted=eq.false'  // Only non-deleted tickets
+                },
+                async (payload) => {
+                    console.log('Real-time update received:', payload);
+                    
+                    if (payload.eventType === 'DELETE' || 
+                        (payload.new && payload.new.deleted === true)) {
+                        // Ticket was deleted - remove from local list
+                        const ticketId = payload.old?.id || payload.new?.id;
+                        if (ticketId && window.ticketManager) {
+                            const index = window.ticketManager.tickets.findIndex(t => t.id === ticketId);
+                            if (index !== -1) {
+                                window.ticketManager.tickets.splice(index, 1);
+                                await window.storageManager.saveTickets(window.ticketManager.tickets, false);
+                                window.ticketManager.updateStats();
+                                
+                                // Show notification
+                                this.showToast(`Ticket ${ticketId} was deleted by another device`, 'info');
+                            }
+                        }
+                    } else if (payload.new && !payload.new.deleted) {
+                        // Ticket was updated or created
+                        const updatedTicket = payload.new;
+                        
+                        if (window.ticketManager) {
+                            const localIndex = window.ticketManager.tickets.findIndex(t => t.id === updatedTicket.id);
+                            
+                            if (localIndex !== -1) {
+                                // Update existing ticket
+                                window.ticketManager.tickets[localIndex] = {
+                                    ...window.ticketManager.tickets[localIndex],
+                                    ...updatedTicket,
+                                    used: updatedTicket.used,
+                                    usedAt: updatedTicket.used_at,
+                                    scanCount: updatedTicket.scan_count || 0,
+                                    deleted: updatedTicket.deleted || false
+                                };
+                            } else {
+                                // Add new ticket
+                                const newTicket = {
+                                    id: updatedTicket.id,
+                                    purchaseDateTime: updatedTicket.purchase_datetime,
+                                    name: updatedTicket.name,
+                                    email: updatedTicket.email,
+                                    phone: updatedTicket.phone,
+                                    ticketType: updatedTicket.ticket_type,
+                                    quantity: updatedTicket.quantity,
+                                    maxScans: updatedTicket.max_scans,
+                                    amount: updatedTicket.amount,
+                                    event: updatedTicket.event,
+                                    eventTime: updatedTicket.event_time,
+                                    eventDate: updatedTicket.event_date,
+                                    venue: updatedTicket.venue,
+                                    used: updatedTicket.used,
+                                    usedAt: updatedTicket.used_at,
+                                    scannedBy: updatedTicket.scanned_by,
+                                    scanCount: updatedTicket.scan_count || 0,
+                                    deleted: updatedTicket.deleted || false
+                                };
+                                window.ticketManager.tickets.push(newTicket);
+                            }
+                            
+                            await window.storageManager.saveTickets(window.ticketManager.tickets, false);
+                            window.ticketManager.updateStats();
+                        }
+                    }
+                }
+            )
+            .subscribe();
+            
+    } catch (error) {
+        console.error('Failed to setup real-time updates:', error);
+    }
+}
+
             async updateTicket(updatedTicket) {
                 if (!this.userRole.canPerformAction('update_ticket')) return false;
                 
@@ -2611,13 +2779,13 @@
                 this.init();
             }
             
-            async init() {
-                await this.initializeSupabase();
-                this.setupEventListeners();
-                this.updateSyncStatus();
-                this.startSyncInterval();
-            }
-            
+           async init() {
+                    await this.initializeSupabase();
+                    this.setupEventListeners();
+                    this.updateSyncStatus();
+                    this.startSyncInterval();
+                    this.setupRealtimeUpdates();
+}
             generateDeviceId() {
                 let deviceId = localStorage.getItem('deviceId');
                 if (!deviceId) {
@@ -2894,7 +3062,26 @@
                     this.updateSyncStatus();
                 }
             }
-            
+                async cleanupDeletedTickets() {
+    if (!this.supabase) return;
+    
+    try {
+        // Permanently delete tickets that were marked as deleted more than 30 days ago
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+        
+        const { error } = await this.supabase
+            .from('tickets')
+            .delete()
+            .eq('deleted', true)
+            .lt('deleted_at', thirtyDaysAgo.toISOString());
+        
+        if (error) console.error('Error cleaning up deleted tickets:', error);
+        
+    } catch (error) {
+        console.error('Error in cleanup:', error);
+    }
+}    
             async downloadTicketsFromCloud() {
                 if (!this.supabase) {
                     return { success: false, error: 'Not connected to cloud' };
